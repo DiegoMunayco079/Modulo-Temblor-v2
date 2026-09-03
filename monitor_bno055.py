@@ -68,18 +68,13 @@ current_cod_id = ""
 current_metadata = {}
 recording_start_time = 0.0
 
-# Valores de condiciones de prueba (editables en la interfaz)
-test_conditions = {
-    "distancia_router_m": "",
-    "tipo_red_wifi": "",
-    "notas": "",
-}
-
 last_tx_time = None
 last_rx_time = None
 start_time_window = None
 samples_counter_window = 0
 bytes_counter_window = 0
+clock_offset_pending = 0.0     # Menor (rx - tx) observado: referencia de offset de reloj
+latency_offset_ready = False   # True una vez calibrado el offset
 
 data_lock = threading.Lock()
 
@@ -128,10 +123,6 @@ def toggle_recording():
 
             current_cod_id = f"P{cod_paciente}_PR{prueba_str}_TP{tipo_str}_ST{subtipo_str}_L{lado_str}_{utc_timestamp}"
 
-            test_conditions["distancia_router_m"] = entry_distancia.get().strip()
-            test_conditions["tipo_red_wifi"] = cb_red_wifi.get().strip()
-            test_conditions["notas"] = entry_notas.get().strip()
-
             current_metadata = {
                 "codigo_paciente": cod_paciente,
                 "prueba": int(prueba_str),
@@ -139,11 +130,6 @@ def toggle_recording():
                 "subtipo": int(subtipo_str),
                 "lado": int(lado_str),
                 "timestamp_utc": utc_timestamp,
-                "condiciones_prueba": {
-                    "distancia_router_m": test_conditions["distancia_router_m"],
-                    "tipo_red_wifi": test_conditions["tipo_red_wifi"],
-                    "notas": test_conditions["notas"],
-                },
             }
 
             is_recording = True
@@ -180,9 +166,6 @@ def set_controls_state(state_mode):
     cb_subtipo.config(state=state_mode)
     cb_lado.config(state=state_mode)
     cb_prueba.config(state="disabled")
-    entry_distancia.config(state=state_mode)
-    cb_red_wifi.config(state="normal" if state_mode == "readonly" else state_mode)
-    entry_notas.config(state=state_mode)
 
 
 def save_data_files(cod_id, metadata, data):
@@ -196,11 +179,6 @@ def save_data_files(cod_id, metadata, data):
     json_filename = os.path.join(JSON_FOLDER, f"{cod_id}.json")
 
     try:
-        condiciones = metadata.get("condiciones_prueba", {})
-        dist = condiciones.get("distancia_router_m", "")
-        red = condiciones.get("tipo_red_wifi", "")
-        notas = condiciones.get("notas", "")
-
         with open(csv_filename, mode="w", newline="", encoding="utf-8") as csv_file:
             writer = csv.writer(csv_file)
             writer.writerow([
@@ -209,8 +187,7 @@ def save_data_files(cod_id, metadata, data):
                 "gx_dps", "gy_dps", "gz_dps",
                 "pc_rx_time_ms", "freq_peak_hz", "psd_peak",
                 "energy_4_7", "energy_2_10", "band_ratio",
-                "esp32_pub_latency_us", "esp32_conn_latency_us", "format",
-                "distancia_router_m", "tipo_red_wifi", "notas"
+                "esp32_pub_latency_us", "esp32_conn_latency_us", "format"
             ])
             for row in data:
                 writer.writerow([
@@ -220,8 +197,7 @@ def save_data_files(cod_id, metadata, data):
                     row["pc_rx_time_ms"], row["freq_peak"], row["psd_peak"],
                     row["energy_4_7"], row["energy_2_10"], row["band_ratio"],
                     row["mqtt_pub_latency_us"], row["mqtt_conn_latency_us"],
-                    row.get("format", "N/A"),
-                    dist, red, notas
+                    row.get("format", "N/A")
                 ])
 
         json_payload = {
@@ -270,9 +246,90 @@ def on_disconnect(client, userdata, rc, properties=None):
     )
 
 
+def _process_sample(
+    seq, timestamp, tx_time_ms, rx_time_ms,
+    ax, ay, az, gx, gy, gz,
+    freq_peak, psd_peak, energy_4_7, energy_2_10, band_ratio,
+    mqtt_pub_latency_us, mqtt_conn_latency_us,
+    format_type, packet_bytes,
+):
+    global start_time_window, samples_counter_window
+
+    with data_lock:
+        if network_stats["last_seq"] != -1 and seq > 0:
+            expected_seq = network_stats["last_seq"] + 1
+            if seq > expected_seq:
+                network_stats["packets_lost"] += seq - expected_seq
+
+        if seq > 0:
+            network_stats["last_seq"] = seq
+
+        network_stats["packets_received"] += 1
+        network_stats["total_bytes"] += packet_bytes
+
+        total_expected = network_stats["packets_received"] + network_stats["packets_lost"]
+        if total_expected > 0:
+            network_stats["loss_rate"] = (network_stats["packets_lost"] / total_expected) * 100.0
+
+        latest_data["timestamp"] = timestamp
+        latest_data["ax"], latest_data["ay"], latest_data["az"] = ax, ay, az
+        latest_data["gx"], latest_data["gy"], latest_data["gz"] = gx, gy, gz
+        latest_data["freq_peak"] = freq_peak
+        latest_data["psd_peak"] = psd_peak
+        latest_data["energy_4_7"] = energy_4_7
+        latest_data["energy_2_10"] = energy_2_10
+        latest_data["band_ratio"] = band_ratio
+        latest_data["mqtt_pub_latency_us"] = mqtt_pub_latency_us
+        latest_data["mqtt_conn_latency_us"] = mqtt_conn_latency_us
+        latest_data["format_type"] = format_type
+
+        time_data.append(timestamp / 1000.0 if timestamp > 0 else rx_time_ms / 1000.0)
+        ax_data.append(ax)
+        ay_data.append(ay)
+        az_data.append(az)
+        gx_data.append(gx)
+        gy_data.append(gy)
+        gz_data.append(gz)
+        freq_peak_data.append(freq_peak)
+        psd_peak_data.append(psd_peak)
+        energy_4_7_data.append(energy_4_7)
+        energy_2_10_data.append(energy_2_10)
+        band_ratio_data.append(band_ratio)
+
+        if start_time_window is None:
+            start_time_window = rx_time_ms
+
+        samples_counter_window += 1
+
+        elapsed_sec = (rx_time_ms - start_time_window) / 1000.0
+        if elapsed_sec >= 0.2:
+            network_stats["effective_hz"] = samples_counter_window / elapsed_sec
+            start_time_window = rx_time_ms
+            samples_counter_window = 0
+
+        if is_recording:
+            recording_buffer.append({
+                "seq": seq,
+                "sample_time_ms": timestamp,
+                "tx_time_ms": tx_time_ms,
+                "ax": round(ax, 3), "ay": round(ay, 3), "az": round(az, 3),
+                "gx": round(gx, 3), "gy": round(gy, 3), "gz": round(gz, 3),
+                "pc_rx_time_ms": round(rx_time_ms, 2),
+                "freq_peak": round(freq_peak, 3),
+                "psd_peak": psd_peak,
+                "energy_4_7": energy_4_7,
+                "energy_2_10": energy_2_10,
+                "band_ratio": round(band_ratio, 5),
+                "mqtt_pub_latency_us": mqtt_pub_latency_us,
+                "mqtt_conn_latency_us": mqtt_conn_latency_us,
+                "format": format_type,
+            })
+
+
 def on_message(client, userdata, msg):
     global last_tx_time, last_rx_time
     global start_time_window, samples_counter_window, bytes_counter_window
+    global clock_offset_pending, latency_offset_ready
 
     rx_time_ms = time.time() * 1000.0
     packet_bytes = len(msg.payload)
@@ -297,107 +354,94 @@ def on_message(client, userdata, msg):
                 data_dict = json.loads(payload_str)
                 format_type = "JSON"
 
-        # EXTRACCIÓN SEGURA DE VALORES
-        seq = int(data_dict.get("seq", 0))
-        timestamp = int(data_dict.get("sample_time_ms", data_dict.get("timestamp", 0)))
-        tx_time_ms = float(data_dict.get("tx_time_ms", rx_time_ms))
-
-        ax, ay, az = float(data_dict.get("ax", 0.0)), float(data_dict.get("ay", 0.0)), float(data_dict.get("az", 0.0))
-        gx, gy, gz = float(data_dict.get("gx", 0.0)), float(data_dict.get("gy", 0.0)), float(data_dict.get("gz", 0.0))
+        # EXTRACCIÓN DE CAMPOS DE NIVEL SUPERIOR
+        raw_seq = int(data_dict.get("seq", 0))
 
         freq_peak = float(data_dict.get("freq_peak", 0.0))
         psd_peak = float(data_dict.get("psd_peak", 0.0))
         energy_4_7 = float(data_dict.get("energy_4_7", 0.0))
         energy_2_10 = float(data_dict.get("energy_2_10", 0.0))
         band_ratio = float(data_dict.get("band_ratio", 0.0))
-        
+
         mqtt_pub_latency_us = int(data_dict.get("mqtt_pub_latency_us", data_dict.get("mqtt_latency_us", 0)))
         mqtt_conn_latency_us = int(data_dict.get("mqtt_conn_latency_us", 0))
 
+        # MÉTRICAS DE RED A NIVEL DE LOTE (paquete MQTT)
+        tx_time_ms = float(data_dict.get("tx_time_ms", 0.0))
+
         with data_lock:
-            if network_stats["last_seq"] != -1 and seq > 0:
-                expected_seq = network_stats["last_seq"] + 1
-                if seq > expected_seq:
-                    network_stats["packets_lost"] += seq - expected_seq
+            if tx_time_ms > 0:
+                clock_diff = rx_time_ms - tx_time_ms
 
-            if seq > 0:
-                network_stats["last_seq"] = seq
+                # Calibración del offset de reloj (mínimo (rx - tx) = offset + retardo mínimo)
+                if not latency_offset_ready:
+                    latency_offset_ready = True
+                    clock_offset_pending = clock_diff
+                else:
+                    if clock_diff < clock_offset_pending:
+                        clock_offset_pending = clock_diff
 
-            network_stats["packets_received"] += 1
-            network_stats["total_bytes"] += packet_bytes
+                real_latency = max(0.0, clock_diff - clock_offset_pending)
+                network_stats["latency_ms"] = real_latency
 
-            total_expected = network_stats["packets_received"] + network_stats["packets_lost"]
-            if total_expected > 0:
-                network_stats["loss_rate"] = (network_stats["packets_lost"] / total_expected) * 100.0
+                # Jitter e inter-arrival entre lotes consecutivos
+                if last_tx_time is not None and last_rx_time is not None:
+                    d_tx = tx_time_ms - last_tx_time
+                    d_rx = rx_time_ms - last_rx_time
+                    if d_tx > 0:
+                        current_jitter = abs(d_rx - d_tx)
+                        network_stats["jitter_ms"] += (current_jitter - network_stats["jitter_ms"]) * 0.1
+                        network_stats["inter_arrival_ms"] += (d_rx - network_stats["inter_arrival_ms"]) * 0.1
 
-            real_latency = rx_time_ms - tx_time_ms
-            network_stats["latency_ms"] = max(0.0, real_latency)
-
-            if last_tx_time is not None and last_rx_time is not None:
-                d_tx = tx_time_ms - last_tx_time
-                d_rx = rx_time_ms - last_rx_time
-                current_jitter = abs(d_rx - d_tx)
-                network_stats["jitter_ms"] += (current_jitter - network_stats["jitter_ms"]) * 0.1
-                network_stats["inter_arrival_ms"] += (d_rx - network_stats["inter_arrival_ms"]) * 0.1
-
-            last_tx_time, last_rx_time = tx_time_ms, rx_time_ms
+                last_tx_time, last_rx_time = tx_time_ms, rx_time_ms
 
             if start_time_window is None:
                 start_time_window = rx_time_ms
 
-            samples_counter_window += 1
             bytes_counter_window += packet_bytes
 
             elapsed_sec = (rx_time_ms - start_time_window) / 1000.0
             if elapsed_sec >= 0.2:
-                network_stats["effective_hz"] = samples_counter_window / elapsed_sec
                 network_stats["bandwidth_kbs"] = (bytes_counter_window / elapsed_sec) / 1024.0
-                start_time_window = rx_time_ms
-                samples_counter_window = 0
                 bytes_counter_window = 0
 
-            latest_data["timestamp"] = timestamp
-            latest_data["ax"], latest_data["ay"], latest_data["az"] = ax, ay, az
-            latest_data["gx"], latest_data["gy"], latest_data["gz"] = gx, gy, gz
-            latest_data["freq_peak"] = freq_peak
-            latest_data["psd_peak"] = psd_peak
-            latest_data["energy_4_7"] = energy_4_7
-            latest_data["energy_2_10"] = energy_2_10
-            latest_data["band_ratio"] = band_ratio
-            latest_data["mqtt_pub_latency_us"] = mqtt_pub_latency_us
-            latest_data["mqtt_conn_latency_us"] = mqtt_conn_latency_us
-            latest_data["format_type"] = format_type
+        samples_list = data_dict.get("samples", None)
 
-            time_data.append(timestamp / 1000.0 if timestamp > 0 else rx_time_ms / 1000.0)
-            ax_data.append(ax)
-            ay_data.append(ay)
-            az_data.append(az)
-            gx_data.append(gx)
-            gy_data.append(gy)
-            gz_data.append(gz)
-            freq_peak_data.append(freq_peak)
-            psd_peak_data.append(psd_peak)
-            energy_4_7_data.append(energy_4_7)
-            energy_2_10_data.append(energy_2_10)
-            band_ratio_data.append(band_ratio)
+        if samples_list and isinstance(samples_list, list) and len(samples_list) > 0:
+            for idx, s in enumerate(samples_list):
+                seq = raw_seq - len(samples_list) + idx + 1
+                timestamp = int(s.get("t", s.get("timestamp", 0)))
+                ax = float(s.get("ax", 0.0))
+                ay = float(s.get("ay", 0.0))
+                az = float(s.get("az", 0.0))
+                gx = float(s.get("gx", 0.0))
+                gy = float(s.get("gy", 0.0))
+                gz = float(s.get("gz", 0.0))
 
-            if is_recording:
-                recording_buffer.append({
-                    "seq": seq,
-                    "sample_time_ms": timestamp,
-                    "tx_time_ms": tx_time_ms,
-                    "ax": round(ax, 3), "ay": round(ay, 3), "az": round(az, 3),
-                    "gx": round(gx, 3), "gy": round(gy, 3), "gz": round(gz, 3),
-                    "pc_rx_time_ms": round(rx_time_ms, 2),
-                    "freq_peak": round(freq_peak, 3),
-                    "psd_peak": psd_peak,
-                    "energy_4_7": energy_4_7,
-                    "energy_2_10": energy_2_10,
-                    "band_ratio": round(band_ratio, 5),
-                    "mqtt_pub_latency_us": mqtt_pub_latency_us,
-                    "mqtt_conn_latency_us": mqtt_conn_latency_us,
-                    "format": format_type,
-                })
+                _process_sample(
+                    seq, timestamp, tx_time_ms, rx_time_ms,
+                    ax, ay, az, gx, gy, gz,
+                    freq_peak, psd_peak, energy_4_7, energy_2_10, band_ratio,
+                    mqtt_pub_latency_us, mqtt_conn_latency_us,
+                    format_type, packet_bytes,
+                )
+        else:
+            seq = raw_seq
+            timestamp = int(data_dict.get("sample_time_ms", data_dict.get("t", data_dict.get("timestamp", 0))))
+            ax = float(data_dict.get("ax", 0.0))
+            ay = float(data_dict.get("ay", 0.0))
+            az = float(data_dict.get("az", 0.0))
+            gx = float(data_dict.get("gx", 0.0))
+            gy = float(data_dict.get("gy", 0.0))
+            gz = float(data_dict.get("gz", 0.0))
+
+            _process_sample(
+                seq, timestamp, tx_time_ms, rx_time_ms,
+                ax, ay, az, gx, gy, gz,
+                freq_peak, psd_peak, energy_4_7, energy_2_10, band_ratio,
+                mqtt_pub_latency_us, mqtt_conn_latency_us,
+                format_type, packet_bytes,
+            )
 
     except Exception as e:
         print("Error decodificando trama MQTT:", e)
@@ -515,7 +559,11 @@ def update_plot():
                 line_ay.set_data(t[:n_acc], ay[:n_acc])
                 line_az.set_data(t[:n_acc], az[:n_acc])
                 ax_plot.set_xlim(min_x, max_x)
-                ax_plot.set_ylim(-25, 25)
+
+                recent_a = ax[-300:] + ay[-300:] + az[-300:]
+                max_a_val = max([abs(v) for v in recent_a], default=15)
+                max_a_val = max(max_a_val, 15.0)
+                ax_plot.set_ylim(-max_a_val * 1.25, max_a_val * 1.25)
 
             n_gyro = min(len(t), len(gx), len(gy), len(gz))
             if n_gyro > 1:
@@ -641,28 +689,6 @@ record_btn = ttk.Button(
     record_frame, text="🔴 Iniciar Grabación", style="Normal.TButton", command=toggle_recording
 )
 record_btn.grid(row=1, column=4, columnspan=2, padx=15, pady=5, sticky="w")
-
-# ============================================================
-# CONDICIONES DE PRUEBA (NOTAS / RED / DISTANCIA)
-# ============================================================
-ttk.Label(record_frame, text="Dist. Router (m):").grid(row=2, column=0, padx=5, pady=5, sticky="e")
-entry_distancia = ttk.Entry(record_frame, width=8, font=("Arial", 10))
-entry_distancia.grid(row=2, column=1, padx=5, pady=5, sticky="w")
-entry_distancia.insert(0, "")
-
-ttk.Label(record_frame, text="Tipo Red WiFi:").grid(row=2, column=2, padx=5, pady=5, sticky="e")
-cb_red_wifi = ttk.Combobox(
-    record_frame,
-    values=["2.4 GHz", "5 GHz", "Ethernet", "Otra"],
-    state="normal",
-    width=12,
-)
-cb_red_wifi.grid(row=2, column=3, padx=5, pady=5, sticky="w")
-
-ttk.Label(record_frame, text="Notas:").grid(row=2, column=4, padx=5, pady=5, sticky="e")
-entry_notas = ttk.Entry(record_frame, width=20, font=("Arial", 10))
-entry_notas.grid(row=2, column=5, padx=5, pady=5, sticky="w")
-entry_notas.insert(0, "")
 
 rec_status_label = ttk.Label(
     record_frame,
